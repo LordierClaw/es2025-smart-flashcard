@@ -27,21 +27,11 @@ const bool LCD_IS_SHOW_BACKLIGHT = true;
 #define AUDIO_DIN    12
 #define AUDIO_VOLUME 21
 
-#define I2S_WS               25
-#define I2S_SD               33
-#define I2S_SCK              26
-#define I2S_PORT             I2S_NUM_0
-#define SAMPLE_RATE          16000
-#define SAMPLE_BUFFER_SIZE   1024
-#define RECORD_DURATION_SEC  4
-#define HEADER_SIZE          44
-
 const unsigned long HOLD_TIME = 1000;
 
 const char* API_BASE        = "http://192.168.0.104:3000";
 const char* API_GET_COLL    = "/api/iot/word-groups";
 const char* API_GET_WORDS   = "/api/iot/word-groups/";
-const char* API_POST_RATING = "/api/iot/pronunciation/";
 const char* API_POST_DIFF   = "/api/iot/words/";
 
 #define SERVICE_UUID                 "19b10000-e8f2-537e-4f6c-d104768a1214"
@@ -54,9 +44,6 @@ enum State {
   STARTUP,
   COLLECTION_SELECTION,
   WORD_SELECTION,
-  RECORD_READY,
-  RECORDING,
-  RATING_RESULT,
   TIMEOUT_MENU
 };
 State currentState = STARTUP;
@@ -70,6 +57,7 @@ int idxWord = 0;
 int lastIdxColl = -1;
 int lastIdxWord = -1;
 
+// Audio output
 String currentAudioUrl = "";
 URLStream url;
 I2SStream out;  // final output of decoded stream
@@ -88,6 +76,8 @@ struct ButtonStatus {
   bool selectHold;
   bool rightHold;
 };
+int holdingButton = 0;
+bool changeState = false;
 
 Preferences preferences;
 
@@ -122,7 +112,7 @@ class MySSIDCharacteristicCallbacks : public BLECharacteristicCallbacks {
     String value = pSSIDCharacteristic->getValue();
     if (value.length() > 0) {
       Serial.print("Received SSID: ");
-      Serial.println(value); // Print the integer value
+      Serial.println(value); 
       preferences.putString("ssid", value);
     }
   }
@@ -133,7 +123,7 @@ class MyPasswordCharacteristicCallbacks : public BLECharacteristicCallbacks {
     String value = pPasswordCharacteristic->getValue();
     if (value.length() > 0) {
       Serial.print("Received Password: ");
-      Serial.println(value); // Print the integer value
+      Serial.println(value); 
       preferences.putString("password", value);
     }
   }
@@ -145,7 +135,7 @@ class MyTokenCharacteristicCallbacks : public BLECharacteristicCallbacks {
     String value = pTokenCharacteristic->getValue();
     if (value.length() > 0) {
       Serial.print("Received SSID: ");
-      Serial.println(value); // Print the integer value
+      Serial.println(value); 
       preferences.putString("token", value);
     }
   }
@@ -212,9 +202,6 @@ void handleState() {
     case STARTUP:              stateStartup(); break;
     case COLLECTION_SELECTION: stateCollection(); break;
     case WORD_SELECTION:       stateWords(); break;
-    case RECORD_READY:         stateRecordReady(); break;
-    case RECORDING:            stateRecording(); break;
-    case RATING_RESULT:        stateRating(); break;
     case TIMEOUT_MENU:         stateTimeout(); break;
   }
 }
@@ -282,6 +269,17 @@ void stateStartup() {
 }
 
 void stateCollection() {
+  waitForButtonRelease();
+  if (collections.size() == 0) {
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("Không có nhóm từ");
+    lcd.setCursor(0,1);
+    lcd.print("Vui lòng thử lại");
+    delay(2000);
+    currentState = STARTUP;
+    return;
+  }
   ButtonStatus btn = checkButtons();
   if (btn.leftClick)  idxColl = (idxColl - 1 + collections.size()) % collections.size();
   if (btn.rightClick) idxColl = (idxColl + 1) % collections.size();
@@ -310,6 +308,7 @@ void stateCollection() {
 }
 
 void stateWords() {
+  waitForButtonRelease();
   ButtonStatus btn = checkButtons();
   if (btn.leftClick)  idxWord = (idxWord - 1 + words.size()) % words.size();
   if (btn.rightClick) idxWord = (idxWord + 1) % words.size();
@@ -330,37 +329,18 @@ void stateWords() {
       Serial.println("Không tìm thấy audio");
     }
   }
-  if (btn.selectHold)   currentState = RECORD_READY;
-  if (btn.leftHold)     currentState = COLLECTION_SELECTION;
-  if (btn.rightHold)    currentState = TIMEOUT_MENU;
-}
-
-void stateRecordReady() {
-  lcd.clear(); lcd.setCursor(0,0); lcd.print("Sẵn sàng thu âm");
-  delay(1500);
-  currentState = RECORDING;
-}
-
-void stateRecording() {
-  lcd.clear(); lcd.setCursor(0,0); lcd.print("Đang thu âm");
-  lcd.setCursor(0,1); lcd.print("Tối đa 4s");
-  Serial.println("đang thu âm");
-  delay(4000);
-  Serial.println("Kết thúc thu âm");
-  currentState = RATING_RESULT;
-}
-
-void stateRating() {
-  lcd.clear(); lcd.setCursor(0,0); lcd.print("Đang đánh giá...");
-  int percent = postRating(words[idxWord].id);
-  lcd.clear(); lcd.setCursor(0,0);
-  lcd.print("Độ chính xác "); lcd.print(percent); lcd.print("%");
-  while (digitalRead(BTN_LEFT_PIN) && digitalRead(BTN_RIGHT_PIN) && digitalRead(BTN_SELECT_PIN));
-  currentState = WORD_SELECTION;
-  lastIdxWord = -1;
+  if (btn.leftHold) {
+    currentState = COLLECTION_SELECTION;
+    changeState = true;
+  }
+  if (btn.rightHold) {
+    currentState = TIMEOUT_MENU;
+    changeState = true;
+  }
 }
 
 void stateTimeout() {
+  waitForButtonRelease();
   const char* items[] = {"Easy","Medium","Hard"};
   const int items_interval[] = {1, 5, 10};
   int sel = 0;
@@ -380,6 +360,7 @@ void stateTimeout() {
     }
   }
   currentState = WORD_SELECTION;
+  changeState = true;
   lastIdxWord = -1;
 }
 
@@ -398,6 +379,7 @@ ButtonStatus checkButtons() {
       while (digitalRead(btn.pin) == LOW) {
         if (millis() - t >= HOLD_TIME) {
           btn.hold = true;
+          holdingButton = btn.pin;
           break;
         }
       }
@@ -405,6 +387,16 @@ ButtonStatus checkButtons() {
     }
   }
   return result;
+}
+
+void waitForButtonRelease() {
+  if (holdingButton == 0) return;
+  if (changeState == false) return;
+  while (digitalRead(holdingButton) == LOW) {
+    delay(10);
+  }
+  holdingButton = 0;
+  changeState = false;
 }
 
 // --- AUDIO OUTPUT FUNCTIONS ---
@@ -425,8 +417,6 @@ void audio_info(const char *info) {
   Serial.print("audio_info: ");
   Serial.println(info);
 }
-
-// --- MICRO RECORD FUNCTIONS ---
 
 // --- WEB API RELATED FUNCTIONS ---
 
@@ -462,24 +452,6 @@ void fetchWords(const String& collId) {
     }
   }
   http.end();
-}
-
-int postRating(const String& wordId) {
-  HTTPClient http; http.begin(String(API_BASE) + API_POST_RATING);
-  http.addHeader("Content-Type", "application/json");
-  String token = preferences.getString("token", "");
-  http.addHeader("x-device-token", token.c_str());
-  DynamicJsonDocument req(256); req["wordId"] = wordId;
-  String body; serializeJson(req, body);
-  int code = http.POST(body);
-  int percent = 0;
-  if (code == 200) {
-    DynamicJsonDocument resp(256);
-    deserializeJson(resp, http.getString());
-    percent = resp["correct_percent"].as<int>();
-  }
-  http.end();
-  return percent;
 }
 
 void postTimeout(const String& wordId, int interval) {
